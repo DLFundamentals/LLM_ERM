@@ -1,4 +1,4 @@
-# LLM-ERM — README
+# LLM-ERM: Sample-Efficient Program Learning via LLM-Guided Search
 
 This repo contains a experiment that prompts an OpenAI GPT-5 model to **synthesize a concise Python function** `f(x)` that matches a hidden target mapping. Datasets are generated from ground-truth functions (binary/decimal, parity/automata/prime/etc.), split deterministically, and persisted to disk. Each model attempt returns code, which is compiled and evaluated; results are logged and exported to JSONL/CSV.
 
