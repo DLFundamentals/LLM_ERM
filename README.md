@@ -218,7 +218,7 @@ Each row is a superset; fields include the full prompt and the raw text returned
   "attempt": 1,
   "prompt": "...",
   "text": "{\"code\": \"def f(x): ...\"}",
-  "usage": { "prompt_tokens": ..., "completion_tokens": ..., "reasoning_tokens": ..., "cached_tokens": ... },
+  "usage": { "prompt_tokens": , "completion_tokens": , "reasoning_tokens": , "cached_tokens": },
   "duration_ms": 1234,
   "cached_tokens": 0,
   "tool_uses": 0,
@@ -236,69 +236,6 @@ Each row is a superset; fields include the full prompt and the raw text returned
 - **Text**: `prompt`, `text` (raw output)
 - **Timing/usage**: `duration_ms`, `cached_tokens`, `prompt_tokens`, `completion_tokens`, `reasoning_tokens`, `tool_uses`, `tool_results_chars`
 - **Metrics**: `val_acc`, `test_acc`, `stopped_early`, `compile_error`
-
----
-
-## Logging
-
-All logs are **single-line JSON** via `JsonFormatter` to both stdout and `runner.log`. Common log types:
-
-- `dataset_reused` / `dataset_generating` / `dataset_written`
-- `attempt_ok` / `attempt_ok_after_retry` / `attempt_failed` / `attempt_retry_once`
-- `compile_or_eval_error`
-- `early_stop`
-- `dispatch_finished`, `artifacts_written`
-
-Set `LOG_LEVEL` (`DEBUG|INFO|WARNING|ERROR`) to control verbosity.
-
----
-
-## Reproducibility details
-
-- For each `(fn, L)`, data splits are derived from:
-  ```
-  derived_seed = (hash((fn, L)) & 0x7fffffff) ^ GLOBAL_SEED
-  ```
-- Files are **atomically** written (temp + `os.replace`) to avoid partial writes.
-- If a persisted file’s line count doesn’t match the requested split size, the split is **regenerated** deterministically.
-
----
-
-## Safety notes on code execution
-
-Model code runs via `exec()` into a restricted global namespace with only `__builtins__`. This is **not a security sandbox**. If you plan to run untrusted code:
-
-- Run in a locked-down container/VM with no network or filesystem access.
-- Consider static checks (AST whitelist), timeouts, and resource limits.
-- Or replace evaluation with a dedicated microservice sandbox.
-
----
-
-## Extending the system
-
-### Add a new ground-truth function
-
-1) Implement a function in `src/target_functions.py` that maps `(N,L)` 0/1 tensors → `(N,)` 0/1 longs.
-2) Register it in `TARGET_FUNCTIONS`.
-3) Use it through `BinaryDataGenerator` by adding a **mapping id**:
-
-```python
-# runner.py
-FUNCTION_NAME_MAPPING["fn_m"] = "your_new_function_name"
-```
-
-
-## Performance tips
-- Use `--concurrency` to increase throughput, but respect API rate limits.
----
-
-## Troubleshooting
-
-- **`OPENAI_API_KEY is required.`** Set the environment variable.
-- **Long stalls**: check `--timeout` and network; the runner retries once per attempt.
-- **`compile_or_eval_error`**: output wasn’t valid JSON, no `"code"`, or couldn’t compile. Inspect `text` in JSONL/CSV.
-- **Dataset rebuild loop**: if you edit split sizes, old files are ignored and rebuilt; delete the old seed dir if needed.
-- **`gmpy2` install issues**: switch to `PrimeDataGenerator` that don’t depend on `gmpy2`.
 
 ---
 
