@@ -4,18 +4,6 @@ This repo contains a experiment that prompts an OpenAI GPT-5 model to **synthesi
 
 ---
 
-## Repository layout
-
-```
-.
-├── runner.py                  # Main orchestrator (async requests, eval, logging, artifacts)
-├── data_handler.py        # Dataset generators (binary/decimal/prime/Dyck/etc.)
-├── target_functions.py    # Ground-truth functions and TARGET_FUNCTIONS registry
-└── runner.log                 # (created at runtime) JSON logs
-```
-
----
-
 ## Dependencies
 
 A complete list of dependencies with exact versions is provided in the `environment.yml` file.
@@ -38,8 +26,6 @@ python runner.py   --functions fn_a   --lengths 100 50 30 25 20 --enable-code-in
 
 ---
 
----
-
 ## Replicate entire expriments
 
 1) **Set your API key**:
@@ -48,19 +34,11 @@ python runner.py   --functions fn_a   --lengths 100 50 30 25 20 --enable-code-in
 export OPENAI_API_KEY=sk-...
 ```
 
-2) **Run this command to replicate. Note : This is long task, will cost $. It will run all funtions (fn_a fn_b fn_c fn_d fn_e fn_f fn_g fn_h fn_i fn_j fn_k ) for all the dimenstions (100 50 30 25 20). All other config used in paper are set as default.** 
+2) **Run this command to replicate. Note : This is long task, will cost $. It will run all funtions (fn_a fn_b fn_c fn_d fn_e fn_f fn_g fn_h fn_i fn_j fn_k fn_l ) for all the dimenstions (100 50 30 25 20). All other config used in paper are set as default.** 
 
 ```bash
 python runner.py --enable-code-interpreter
 ```
-
-3) **Artifacts** (written at the end):
-
-- `results_attempts.jsonl` — all attempts with raw text and usage payloads
-- `results_attempts.csv` — curated, analysis-friendly columns
-- `datasets/` — persisted train/val/test under target/length/seed
-- `runner.log` — structured JSON logs for every step
-
 ---
 
 ## CLI usage
