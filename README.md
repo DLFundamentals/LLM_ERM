@@ -83,7 +83,7 @@ python runner.py   --functions fn_a fn_j fn_i   --lengths 100 50   --attempts 8 
 | fn_e | `parity_rand_3`               | binary |
 | fn_f | `parity_rand_10`              | binary |
 | fn_g | `palindrome`                  | binary |
-| fn_h | `dyck2`                       | binary (special lengths: `[100,80,60,40,20]`) |
+| fn_h | `dyck2`                       | binary (lengths: `[100,80,60,40,20]`) |
 | fn_i | `prime_decimal`               | **decimal** |
 | fn_j | `automata_parity`             | binary |
 | fn_k | `prime_decimal_tf_check`      | **decimal** |
