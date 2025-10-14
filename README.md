@@ -70,45 +70,6 @@ python runner.py   --functions fn_a fn_j fn_i   --lengths 100 50   --attempts 8 
 
 ---
 
-## What the runner actually does
-
-1) **Derive deterministic seed** per `(fn, L)`:
-   ```
-   derived_seed = (hash((fn, L)) & 0x7fffffff) ^ global_seed
-   ```
-   Datasets are saved under:
-   ```
-   datasets/<target_name>/L<length>/seed<derived_seed>/{train.txt,val.txt,test.txt,meta.json}
-   ```
-
-2) **Generate or reuse data**  
-   If files exist with exact sizes, they’re reused; else they’re regenerated with the derived seed.
-
-3) **Build prompt**  
-   Uses a small batch of training examples, with a **binary** or **decimal** problem statement depending on the target (see `DECIMAL_FNS`). The user content ends with:
-   ```
-   You must output ONLY a single JSON object: {"code": "<python function>"}.
-   ```
-
-4) **Call Responses API** (async, concurrency-limited)  
-   Code Interpreter tool injection via `--enable-code-interpreter`. One retry for transient errors. **MUST use this to replicate the results**
-
-5) **Extract & compile code**  
-   - Parse output as JSON; fallback to `{ ... }` regex if needed.  
-   - Remove Markdown fences, dedent, parse AST.  
-   - Prefer `def f(x): ...`; otherwise take the first function.  
-   - `exec` in a restricted global namespace (`__builtins__` only) and retrieve the callable.
-
-6) **Evaluate**  
-   - Validate on `val.txt` via `_local_get_accuracy` (`external_get_accuracy` hook supported).  
-   - If `val_acc == 1.0`, evaluate on test and **early-stop**.  
-   - Otherwise continue attempts up to `--attempts`.
-
-7) **Log & export**  
-   Every step emits a JSON record to stdout + `runner.log`. Final arrays of rows are written to JSONL/CSV.
-
----
-
 ## Targets and functions
 
 `runner.py` uses a compact “experiment ID” → target mapping:
