@@ -36,13 +36,6 @@ export OPENAI_API_KEY=sk-...
 python runner.py   --functions fn_a   --lengths 100 50 30 25 20 --enable-code-interpreter
 ```
 
-3) **Artifacts** (written at the end):
-
-- `results_attempts.jsonl` — all attempts with raw text and usage payloads
-- `results_attempts.csv` — curated, analysis-friendly columns
-- `datasets/` — persisted train/val/test under target/length/seed
-- `runner.log` — structured JSON logs for every step
-
 ---
 
 ---
