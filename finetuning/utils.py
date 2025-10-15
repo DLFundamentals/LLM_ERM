@@ -21,13 +21,6 @@ def print_performance(epoch, train_acc, test_acc):
     print(f'##### Test: epoch={epoch}: Acc={test_acc:.4f}')
     print(f'#############################################')
 
-def load_settings(settings_path):
-    """Load settings module from the given path."""
-    spec = importlib.util.spec_from_file_location("settings", settings_path)
-    settings = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(settings)
-    return settings
-
 def save_data(dir_name, metrics):
     # Ensure the directory exists
     os.makedirs(dir_name, exist_ok=True)

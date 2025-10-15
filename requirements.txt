@@ -1,0 +1,19 @@
+# requirements.txt
+# This file is for Pip. It lists the pure Python & AI/ML libraries.
+
+# --- LLM Libraries (Hugging Face ecosystem, etc.) ---
+transformers
+accelerate
+vllm
+xformers
+tokenizers
+sentencepiece
+safetensors
+
+# --- API Clients for LLM Services ---
+openai
+
+# --- Other useful utilities ---
+tqdm
+pyyaml
+sympy>=1.12

@@ -25,12 +25,11 @@ from tqdm import tqdm
 from typing import List, Dict, Any, Set, Tuple, Union
 from abc import ABC, abstractmethod
 
-from target_functions import TARGET_FUNCTIONS
+from .target_functions import TARGET_FUNCTIONS
 
 # --- Module-level Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-random.seed(42)
 
 # Optional dependency handling for performance
 try:
@@ -579,3 +578,128 @@ class PalindromeDataGenerator(BaseTensorGenerator):
                     if seq_tuple not in pal_set and seq_tuple not in nonpal_set:
                         nonpal_set.add(seq_tuple)
         return torch.tensor(random.sample(list(nonpal_set), count), dtype=torch.long, device=self.device)
+    
+
+def get_data_generator(target_name: str, sequence_length: int, num_samples: int) -> BaseDataGenerator:
+    """
+    Factory function to select and instantiate the correct data generator.
+
+    Args:
+        target_name (str): The name of the target function (e.g., 'dyck2', 'palindrome').
+        sequence_length (int): The length of the input sequences (L).
+        num_samples (int): The number of samples to generate.
+
+    Returns:
+        An instance of a BaseDataGenerator subclass.
+    """
+    # This logic is now centralized here
+    if target_name == 'dyck2':
+        # Dyck-2 generator has constraints on sample size for smaller lengths
+        if sequence_length == 20:
+            return Dyck2DataGenerator(sequence_length, num_samples, allow_duplicates=True)
+        else:
+            return Dyck2DataGenerator(sequence_length, num_samples)
+    
+    if target_name in ['patternmatch1', 'patternmatch2']:
+        if target_name == 'patternmatch2':
+            return PatternBasedDataGenerator(sequence_length, num_samples, pattern_string='00111111')
+        else:
+            return PatternBasedDataGenerator(sequence_length, num_samples)  # defaults to '10101010'
+    
+    if target_name == "palindrome":
+        if sequence_length == 20:
+            return PalindromeDataGenerator(sequence_length, num_samples, allow_duplicates=True)
+        else:
+            return PalindromeDataGenerator(sequence_length, num_samples)
+        
+    if target_name == "prime_decimal":
+        return PrimeDataGenerator(sequence_length, num_samples)
+        
+    if target_name == "prime_decimal_tf_check":
+        return PrimeDecimalTailRestrictedDataGenerator(sequence_length, num_samples, allow_leading_zeros=False)
+    
+    # Default to BinaryDataGenerator for all other function names
+    if target_name in TARGET_FUNCTIONS:
+        return BinaryDataGenerator(target_name, sequence_length, num_samples)
+
+    raise ValueError(f"No data generator found for target function '{target_name}'")
+
+def create_stratified_splits(
+    all_samples: List[Dict[str, Any]],
+    train_size: int,
+    val_size: int,
+    test_size: int,
+    device: str = 'cpu'
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Creates stratified train, validation, and test splits from a generated dataset.
+
+    This utility ensures that each split maintains a balanced 50/50 class distribution,
+    which is critical for the experiments.
+
+    Args:
+        all_samples: A list of generated data samples, where each sample is a
+                     dictionary like {'Input': np.array, 'Output': '0' or '1'}.
+        train_size: The desired number of samples in the training set.
+        val_size: The desired number of samples in the validation set.
+        test_size: The desired number of samples in the test set.
+        device: The torch device to use for tensor operations.
+
+    Returns:
+        A tuple containing three lists of dictionaries:
+        (train_split, validation_split, test_split).
+    """
+    if train_size % 2 != 0:
+        raise ValueError("train_size must be even for a balanced split.")
+    if val_size % 2 != 0:
+        raise ValueError("val_size must be even for a balanced split.")
+
+    # Convert the list of dicts to a format that's easier to split
+    original_indices = list(range(len(all_samples)))
+    all_labels = torch.tensor([int(s['Output']) for s in all_samples], device=device)
+
+    # Separate indices by class
+    indices_0 = torch.where(all_labels == 0)[0]
+    indices_1 = torch.where(all_labels == 1)[0]
+
+    # Deterministic shuffle of indices for each class
+    shuffled_indices_0 = indices_0[torch.randperm(len(indices_0), device=device)]
+    shuffled_indices_1 = indices_1[torch.randperm(len(indices_1), device=device)]
+
+    # Calculate samples per class for each split
+    train_per_class = train_size // 2
+    val_per_class = val_size // 2
+
+    if len(shuffled_indices_0) < train_per_class + val_per_class:
+        raise ValueError("Not enough samples of class 0 for the requested train/val split size.")
+    if len(shuffled_indices_1) < train_per_class + val_per_class:
+        raise ValueError("Not enough samples of class 1 for the requested train/val split size.")
+
+    # Create train indices
+    train_indices_0 = shuffled_indices_0[:train_per_class]
+    train_indices_1 = shuffled_indices_1[:train_per_class]
+    train_indices = torch.cat([train_indices_0, train_indices_1])
+    # Final shuffle to mix classes within the training set
+    train_indices = train_indices[torch.randperm(len(train_indices), device=device)]
+
+    # Create validation indices
+    val_indices_0 = shuffled_indices_0[train_per_class : train_per_class + val_per_class]
+    val_indices_1 = shuffled_indices_1[train_per_class : train_per_class + val_per_class]
+    val_indices = torch.cat([val_indices_0, val_indices_1])
+
+    # Create test indices from the remainder
+    test_indices_0 = shuffled_indices_0[train_per_class + val_per_class:]
+    test_indices_1 = shuffled_indices_1[train_per_class + val_per_class:]
+    test_indices = torch.cat([test_indices_0, test_indices_1])
+
+    # Reconstruct the splits using the original list and the selected indices
+    train_split = [all_samples[i] for i in train_indices.tolist()]
+    val_split = [all_samples[i] for i in val_indices.tolist()]
+    test_split = [all_samples[i] for i in test_indices.tolist()]
+
+    # Sanity checks
+    assert len(train_split) == train_size
+    assert len(val_split) == val_size
+    assert len(test_split) == test_size
+
+    return train_split, val_split, test_split

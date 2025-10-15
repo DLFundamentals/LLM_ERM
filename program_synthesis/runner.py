@@ -10,13 +10,14 @@
 #   • Calls the OpenAI Responses API asynchronously with concurrency control.
 #   • Extracts a candidate function from the model’s JSON output, compiles it,
 #     and evaluates its accuracy on validation (and then test, on perfect val).
-#   • Performs multiple attempts per grid point and supports early‑stopping when
-#     validation accuracy hits 1.0. Else take the test accuracy correspondint to 
-#     the maxiumum validation accuracy.
+#   • Performs multiple attempts per grid point and supports early-stopping when 
+#     validation accuracy hits 1.0. If no attempt achieves perfect validation, 
+#     all results are logged for post-processing to select the best one.
+#     can choose the best validation in postprocessing). 
 #   • Logs all steps as structured JSON to stdout and to runner.log.
 #   • Emits a JSONL and CSV with detailed metrics per attempt.
 #
-# Some more techinal details:
+# Some more technical details:
 #   1) Dataset persistence & determinism: For any (fn, L) pair and a global seed,
 #      derived_seed = (hash((fn, L)) & 0x7fffffff) ^ global_seed. Splits are saved
 #      under datasets/<target>/L<length>/seed<derived_seed>/, so subsequent runs
@@ -24,27 +25,28 @@
 #   2) Prompts demand a single JSON object with the generated function under
 #      the "code" key, simplifying parsing.
 #   3) Compilation sandbox: we `exec` inside a controlled namespace and pick the
-#      function named `f` if present (else the first def). We coerce predictions
-#      to 0/1 with bool().
+#      function named `f` if present (else the first def). We normalize predictions
+#      to {0,1} via _normalize_pred_to01 (supports ints/bools/strings/tensor scalars).
 #   4) Early stop: if validation accuracy is exactly 1.0, we compute test and stop.
 # =====================================================================================
 
 from __future__ import annotations
-import os, sys, json, csv, time, argparse, asyncio, re, ast, textwrap, random, tempfile, shutil
+import os, sys, json, csv, time, argparse, asyncio, re, ast, textwrap, random, tempfile, shutil, hashlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Mapping, Callable
 import logging
 
+import os
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, parent_dir)
+
 from openai import AsyncOpenAI
 
-# --- data generators (unchanged; we orchestrate them here) ---
-# These classes must provide a .generate_data() method returning an iterable of
-# samples where each sample has keys 'Input' (array of characters '0'/'1') and
-# 'Output' ('0' or '1').
-from data_handler import (
-    BinaryDataGenerator, Dyck2DataGenerator, PatternBasedDataGenerator, 
-    PrimeDataGenerator, PalindromeDataGenerator, PrimeDecimalTailRestrictedDataGenerator,
-)
+# --- data generators ---
+from src.data_handler import get_data_generator, create_stratified_splits
+from src.target_functions import EXPERIMENT_FUNCTION_MAPPING, EXPERIMENT_FUNCTION_METADATA
 
 external_get_accuracy = None
 
@@ -150,7 +152,7 @@ def setup_logger(level: str = "INFO") -> logging.Logger:
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(JsonFormatter())
 
-    file_handler = logging.FileHandler("runner.log", encoding="utf-8")
+    file_handler = logging.FileHandler("program_synthesis/runner.log", encoding="utf-8")
     file_handler.setFormatter(JsonFormatter())
 
     # Replace any existing handlers to avoid duplicate logs
@@ -205,11 +207,11 @@ class Config:
     val_size: int   = int(os.getenv("VAL_SIZE",   "100"))
     test_size: int  = int(os.getenv("TEST_SIZE",  "10000"))
     seed: int       = int(os.getenv("GLOBAL_SEED","42"))
-    dataset_dir: str = os.getenv("DATASET_DIR", "datasets")
+    dataset_dir: str = os.getenv("DATASET_DIR", "program_synthesis/datasets")
 
     # Artifacts
-    out_jsonl: str = os.getenv("OUT_JSONL", "results_attempts.jsonl")
-    out_csv: str   = os.getenv("OUT_CSV",   "results_attempts.csv")
+    out_jsonl: str = os.getenv("OUT_JSONL", "program_synthesis/results_attempts.jsonl")
+    out_csv: str   = os.getenv("OUT_CSV",   "program_synthesis/results_attempts.csv")
 
 
 # =========================
@@ -243,24 +245,11 @@ def build_user_prompt(data_examples: List[str], seq_len: int, decimal: bool = Fa
 # =========================
 # Function mapping & decimal set
 # =========================
-# Map short experiment IDs (fn_a ... fn_l) to target generator names in data_handler.
+# Map short experiment IDs (fn_a ... fn_l) to target generator names.
 # DECIMAL_FNS marks those targets that operate on decimal strings, affecting the
 # problem statement.
 
-FUNCTION_NAME_MAPPING = {
-    "fn_a": "parity_all",
-    "fn_b": "parity_first_half",
-    "fn_c": "patternmatch1",
-    "fn_d": "patternmatch2",
-    "fn_e": "parity_rand_3",
-    "fn_f": "parity_rand_10",
-    "fn_g": "palindrome",
-    "fn_h": "dyck2",
-    "fn_i": "prime_decimal",
-    "fn_j": "automata_parity",
-    "fn_k": "prime_decimal_tf_check",
-    "fn_l": "sha256_parity",
-}
+FUNCTION_NAME_MAPPING = EXPERIMENT_FUNCTION_MAPPING
 
 DECIMAL_FNS = {"prime_decimal", "prime_decimal_tf_check"}
 
@@ -342,139 +331,72 @@ class DatasetStore:
         }
 
     def _generate_lines(self, target_name: str, L: int, size: int) -> List[str]:
-        # Select the correct generator (exactly as your original logic)
-        if target_name == 'dyck2':
-            if L == 20:
-                # IMPORTANT : Only limited samples are possible to make in low dimentions.
-                gen = Dyck2DataGenerator(L, size, allow_duplicates=True)
-            else:
-                gen = Dyck2DataGenerator(L, size)
-            dataset = gen.generate_data()
-        elif target_name in ['patternmatch1', 'patternmatch2']:
-            if target_name == 'patternmatch2':
-                gen = PatternBasedDataGenerator(L, size, pattern_string='00111111')
-            else:
-                gen = PatternBasedDataGenerator(L, size)  # defaults to '10101010'
-            dataset = gen.generate_data()
-        elif target_name == "palindrome":
-            if L == 20:
-                gen = PalindromeDataGenerator(L, size, allow_duplicates=True)
-            else:
-                gen = PalindromeDataGenerator(L, size)
-            dataset = gen.generate_data()
-        elif target_name == "prime_decimal":
-            gen = PrimeDataGenerator(L, size)
-            dataset = gen.generate_data()
-        elif target_name == "prime_decimal_tf_check":
-            gen = PrimeDecimalTailRestrictedDataGenerator(L, size, False)
-            dataset = gen.generate_data()
-        else:
-            gen = BinaryDataGenerator(target_name, L, size)
-            dataset = gen.generate_data()
-
+        # Select the correct generator using the centralized factory function
+        gen = get_data_generator(target_name, L, size)
+        dataset = gen.generate_data()
+        
         # Render each sample as "<sequence> -> <label>" line for simple evaluation later.
-        return [f"{''.join(sample['Input'].tolist())} -> {sample['Output']}" for sample in dataset]
+        return [f"{''.join(sample['Input'])} -> {sample['Output']}" for sample in dataset]
+    
+    def _stable_derived_seed(self, fn: str, L: int) -> int:
+        # include sizes so different configs don’t collide
+        key = f"{fn}|L={L}|train={self.cfg.train_size+self.cfg.val_size}|test={self.cfg.test_size}|base_seed={self.cfg.seed}"
+        digest = hashlib.sha256(key.encode("utf-8")).digest()
+        return (int.from_bytes(digest[:8], "big") & 0x7FFFFFFF)
 
     def _ensure_splits(self, fn: str, L: int) -> Tuple[List[str], List[str], List[str], bool]:
         target_name = FUNCTION_NAME_MAPPING[fn]
         is_decimal = target_name in DECIMAL_FNS
 
-        import hashlib
-        # The SGD script splits into train/test, so we combine val+train sizes for its 'train' part.
-        sgd_equivalent_train_size = self.cfg.train_size + self.cfg.val_size
-        sgd_equivalent_test_size = self.cfg.test_size
-        hash_str = (
-            f"func={target_name}-len={L}-"
-            f"train={sgd_equivalent_train_size}-test={sgd_equivalent_test_size}"
-        )
-
-        h = hashlib.sha256(hash_str.encode()).digest()
-        derived_seed = (int.from_bytes(h, 'big') & 0x7fffffff) ^ self.cfg.seed
+        # Deriving a seed for caching
+        derived_seed = self._stable_derived_seed(fn, L)
         paths = self._paths(target_name, L, derived_seed)
-        os.makedirs(paths["dir"], exist_ok=True)
 
         def exists_with_size(path: str, expect: int) -> bool:
-            # Guard against truncated files or wrong sizes by counting lines.
-            if not os.path.exists(path):
-                return False
+            if not os.path.exists(path): return False
             try:
-                cnt = sum(1 for _ in open(path, "r", encoding="utf-8"))
-                return cnt == expect
+                return sum(1 for _ in open(path, "r", encoding="utf-8")) == expect
             except Exception:
                 return False
 
-        # If all exist with exact sizes, reuse from cache
         if (exists_with_size(paths["train"], self.cfg.train_size) and
             exists_with_size(paths["val"],   self.cfg.val_size)   and
             exists_with_size(paths["test"],  self.cfg.test_size)):
-            train_lines = _read_lines(paths["train"])
-            val_lines   = _read_lines(paths["val"])
-            test_lines  = _read_lines(paths["test"])
             self.log.info("dataset_reused", extra={"fn": fn, "length": L, "seed": derived_seed, "dir": paths["dir"]})
-            return train_lines, val_lines, test_lines, is_decimal
+            return _read_lines(paths["train"]), _read_lines(paths["val"]), _read_lines(paths["test"]), is_decimal
 
-        # Otherwise (re)generate deterministically and write atomically
         self._set_seed(derived_seed)
         self.log.info("dataset_generating", extra={"fn": fn, "length": L, "seed": derived_seed, "dir": paths["dir"]})
 
-        # 1. Generate ONE large, ORDERED pool of data.
-        total_samples_for_pool = self.cfg.train_size + self.cfg.val_size + self.cfg.test_size
-        all_lines = self._generate_lines(target_name, L, total_samples_for_pool)
+        # 1. Generate ONE large pool of data.
+        total_samples = self.cfg.train_size + self.cfg.val_size + self.cfg.test_size
+        generator = get_data_generator(target_name, L, total_samples)
+        all_samples_dicts = generator.generate_data() # This returns List[Dict]
 
-        # 2. Separate the positive and negative samples based on their initial order.
-        num_pos_total = total_samples_for_pool // 2
-        
-        pos_lines = all_lines[:num_pos_total]
-        neg_lines = all_lines[num_pos_total:]
-        
-        # 3. Perform a deterministic shuffle ON EACH CLASS SEPARATELY.
-        # This mimics the SGD script's `torch.randperm` on the indices of each class.
-        random.shuffle(pos_lines)
-        random.shuffle(neg_lines)
-
-        # 4. Perform the stratified split by slicing the shuffled class lists.
-        # This guarantees a 50/50 balance in train and validation sets.
-        train_pos_count = self.cfg.train_size // 2
-        train_neg_count = self.cfg.train_size - train_pos_count
-        
-        val_pos_count = self.cfg.val_size // 2
-        val_neg_count = self.cfg.val_size - val_pos_count
-
-        # Combine the slices to create the train, val, and test sets
-        train_lines = pos_lines[:train_pos_count] + neg_lines[:train_neg_count]
-        
-        val_lines = (
-            pos_lines[train_pos_count : train_pos_count + val_pos_count] + 
-            neg_lines[train_neg_count : train_neg_count + val_neg_count]
-        )
-                    
-        test_lines = (
-            pos_lines[train_pos_count + val_pos_count:] + 
-            neg_lines[train_neg_count + val_neg_count:]
+        # 2. Use our new centralized function to create the splits.
+        train_split_dicts, val_split_dicts, test_split_dicts = create_stratified_splits(
+            all_samples=all_samples_dicts,
+            train_size=self.cfg.train_size,
+            val_size=self.cfg.val_size,
+            test_size=self.cfg.test_size,
+            device='cpu' # Use CPU for this script as it doesn't need GPU
         )
 
-        # 5. Final shuffle of the combined train and validation sets before saving.
-        # This mixes the positive and negative samples within each split.
+        # 3. Convert the resulting splits back into the "sequence -> label" line format.
+        train_lines = [f"{''.join(s['Input'])} -> {s['Output']}" for s in train_split_dicts]
+        val_lines = [f"{''.join(s['Input'])} -> {s['Output']}" for s in val_split_dicts]
+        test_lines = [f"{''.join(s['Input'])} -> {s['Output']}" for s in test_split_dicts]
+        
+        # 4. Final shuffle of train and validation lines before saving (for prompt diversity)
         random.shuffle(train_lines)
         random.shuffle(val_lines)
-        # The test set is not shuffled
-
-        # 6. Sanity checks for sizes
-        assert len(train_lines) == self.cfg.train_size
-        assert len(val_lines) == self.cfg.val_size
-        assert len(test_lines) == self.cfg.test_size
-
-        # 7. Write the final splits atomically to disk
+        
         _safe_write_text_lines(paths["train"], train_lines)
         _safe_write_text_lines(paths["val"],   val_lines)
         _safe_write_text_lines(paths["test"],  test_lines)
         _safe_write_json(paths["meta"], {
-            "fn": fn,
-            "target_name": target_name,
-            "length": L,
-            "decimal": is_decimal,
+            "fn": fn, "target_name": target_name, "length": L, "decimal": is_decimal,
             "derived_seed": derived_seed,
-            "hash_str_used": hash_str,
             "sizes": {"train": self.cfg.train_size, "val": self.cfg.val_size, "test": self.cfg.test_size},
             "created_ts": int(time.time())
         })
@@ -542,10 +464,49 @@ def compile_callable_from_code(code_str: str) -> Callable[[str], int]:
 # Evaluate a callable against a list of "<sequence> -> <label>" lines. We default
 # to a local implementation but can delegate to external_get_accuracy if present.
 
-def _local_get_accuracy(fn_callable: Callable[[str], int], data_lines: List[str]) -> float:
+def _normalize_pred_to01(pred) -> int:
+    """
+    Coerce various return types into an integer 0/1.
+    Accepts: 0/1 ints, bools, '0'/'1' strings, 'true'/'false' strings,
+    and objects with .item(). Falls back to truthiness only as last resort.
+    """
+    try:
+        # numpy / torch scalars
+        if hasattr(pred, "item"):
+            pred = pred.item()
+    except Exception:
+        pass
+
+    # direct ints / bools
+    if isinstance(pred, bool):
+        return 1 if pred else 0
+    if isinstance(pred, int):
+        return 1 if pred != 0 else 0
+
+    # strings
+    if isinstance(pred, str):
+        s = pred.strip().strip("\"'")
+        if s in ("0", "1"):
+            return int(s)
+        sl = s.lower()
+        if sl in ("true", "false"):
+            return 1 if sl == "true" else 0
+        # try numeric string
+        try:
+            v = int(float(s))
+            return 1 if v != 0 else 0
+        except Exception:
+            # last resort: non-empty string is truthy — but avoid the "0" trap handled above
+            return 1 if len(s) > 0 else 0
+
+    # anything else: truthiness fallback
+    return 1 if pred else 0
+
+def _local_get_accuracy(fn_callable: Callable[[str], int], data_lines: List[str], logger = None) -> float:
     if not data_lines:
         return 0.0
     correct = 0
+    errors = 0
     for line in data_lines:
         try:
             x, y = line.split("->")
@@ -553,20 +514,23 @@ def _local_get_accuracy(fn_callable: Callable[[str], int], data_lines: List[str]
             y = y.strip()
             y_int = int(y)
             pred = fn_callable(x)
-            pred_int = int(bool(pred))
+            pred_int = _normalize_pred_to01(pred)
             correct += int(pred_int == y_int)
-        except Exception:
-            # Silently ignore malformed lines or runtime errors in user code.
-            pass
+        except Exception as e:
+            if errors < 5: # Log first 5 errors to avoid spam
+                logger.debug("Evaluation error on generated code", extra={"line": line, "error": str(e)})
+            errors += 1
+    if errors > 0:
+        logger.warning(f"Encountered {errors} errors during evaluation of generated code.")
     return correct / len(data_lines)
 
-def evaluate_accuracy(fn_callable: Callable[[str], int], data_lines: List[str]) -> float:
+def evaluate_accuracy(fn_callable: Callable[[str], int], data_lines: List[str], logger = None) -> float:
     if external_get_accuracy is not None:
         try:
             return float(external_get_accuracy(fn_callable, data_lines))
         except Exception:
             pass
-    return _local_get_accuracy(fn_callable, data_lines)
+    return _local_get_accuracy(fn_callable, data_lines, logger)
 
 
 # =========================
@@ -689,9 +653,8 @@ class Runner:
                 self.log.error("unknown_function", extra={"fn": fn})
                 continue
             
-            current_lengths = self.cfg.lengths
-            if fn == "fn_h":
-                current_lengths = [100, 80, 60, 40, 20]
+            task_meta = EXPERIMENT_FUNCTION_METADATA.get(fn, {})
+            current_lengths = task_meta.get("lengths", self.cfg.lengths)
             for L in current_lengths:
                 # 1) persistent dataset
                 train_lines, val_lines, test_lines, is_decimal = self.ds.get(fn, L)
@@ -712,10 +675,10 @@ class Runner:
                     if code_str:
                         try:
                             fn_callable = compile_callable_from_code(code_str)
-                            val_acc = evaluate_accuracy(fn_callable, val_lines)
+                            val_acc = evaluate_accuracy(fn_callable, val_lines, self.log)
+                            test_acc = evaluate_accuracy(fn_callable, test_lines, self.log)
                             if val_acc >= max_val_acc:
                                 max_val_acc = val_acc
-                                test_acc = evaluate_accuracy(fn_callable, test_lines)
                                 if val_acc == 1.0:
                                     stopped_early = True
                         except Exception as e:
@@ -812,12 +775,12 @@ def parse_args() -> Config:
     p.add_argument("--train-size", type=int, help="Train size per (fn, L) (default: 100)")
     p.add_argument("--val-size", type=int, help="Validation size per (fn, L) (default: 100)")
     p.add_argument("--test-size", type=int, help="Test size per (fn, L) (default: 10000)")
-    p.add_argument("--seed", type=int, help="Global seed (default: 432)")
-    p.add_argument("--dataset-dir", type=str, help="Dataset root directory (default: datasets)")
+    p.add_argument("--seed", type=int, help="Global seed (default: 42)")
+    p.add_argument("--dataset-dir", type=str, help="Dataset root directory (default: program_synthesis/datasets)")
 
     # Artifacts
-    p.add_argument("--out-jsonl", help="Output JSONL path (default: results_attempts.jsonl)")
-    p.add_argument("--out-csv", help="Output CSV path (default: results_attempts.csv)")
+    p.add_argument("--out-jsonl", help="Output JSONL path (default: program_synthesis/results_attempts.jsonl)")
+    p.add_argument("--out-csv", help="Output CSV path (default: program_synthesis/results_attempts.csv)")
     p.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"), help="Logging level (default: INFO)")
     p.add_argument("--dry-run", action="store_true", help="Dry run, shows input prompt generated for each query")
 

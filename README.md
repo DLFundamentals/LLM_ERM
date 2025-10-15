@@ -1,132 +1,72 @@
-# LLM-ERM: Sample-Efficient Program Learning via LLM-Guided Search
+# LLM-ERM: 
 
-This repo contains a experiment that prompts an OpenAI GPT-5 model to **synthesize a concise Python function** `f(x)` that matches a hidden target mapping. Datasets are generated from ground-truth functions (binary/decimal, parity/automata/prime/etc.), split deterministically, and persisted to disk. Each model attempt returns code, which is compiled and evaluated; results are logged and exported to JSONL/CSV.
+[GitHub Pages]() • [Project Pages]() • [Paper Pages]()
 
----
+Our work addresses the following question : 
+> Can we design learning algorithms that combine the sample efficiency of finite-class program search with the computational efficiency of modern optimization methods?
 
-## Dependencies
+## Abstract
 
-A complete list of dependencies with exact versions is provided in the `environment.yml` file.
+We seek algorithms for program learning that are both sample-efficient and computationally feasible. In the realizable short-program regime, length-first (Occam/MDL) enumeration achieves near-optimal PAC rates—if the target has a length-(L) description over alphabet ($\Sigma$), finite-class ERM requires only $(\mathcal{O}(L\log|\Sigma|/\epsilon))$ samples—but naïve length-first enumeration is computationally infeasible. Consequently, algorithms such as online stochastic gradient descent (SGD) are widely used in practice, yet they can be sample-inefficient: under the statistical query (SQ) framework, iteration/sample lower bounds scale with SQ dimension, implying exponential data requirements for learning parity functions and related short-program families.
 
----
+To address this gap, we introduce LLM-ERM, a propose-and-verify framework that replaces exhaustive enumeration with an LLM-guided search over candidate programs while retaining ERM-style selection on held-out data. Specifically, we draw $k$ candidates with a pretrained reasoning-augmented LLM, compile and check each on the data, and return the best verified hypothesis, with no feedback, adaptivity, or gradients. Theoretically, we formalize how SQ hardness transfers to SGD iteration complexity on high-SQ-dimension classes. {\em Empirically, LLM-ERM solves tasks such as parity variants, pattern matching, and primality testing with as few as 200 samples, while SGD-trained transformers overfit even with 100,000 samples}. These results indicate that language-guided program synthesis recovers much of the statistical efficiency of finite-class ERM while remaining computationally tractable, offering a practical route to learning succinct hypotheses beyond the reach of gradient-based training.
 
-## Quick start (For a single function - Full Parity)
+## LLM-ERM • In-Context • Fine-Tuning
 
-1) **Set your API key**:
+The repository contains three types of experiments.
 
+- **llm-erm** — Synthesize a Python function `f(x)` that matches the input-output relationship.
+- **in_context_learning** — Run local models via **vLLM**; few-shot prompts with hundreds of examples; batched inference and accuracy summaries.
+- **finetuning** — Train from scratch or finetune LMs (e.g., Qwen/Llama/DeepSeek) as **binary classifiers** on the same tasks; YAML sweeps included.
+
+## Quickstart
+
+```bash
+# 1) Create environment (Conda)
+conda env create -f environment.yaml
+conda activate llm_erm
+
+# 2) (Not Required) Already included in environment.yaml
+pip install -r requirements.txt
+```
+
+### LLM-ERM (OpenAI)
 ```bash
 export OPENAI_API_KEY=sk-...
+python program_synthesis/runner.py --functions fn_a --lengths 50 --attempts 3 --enable-code-interpreter
 ```
 
-2) **Do Not Run default grid if resources are limited(Runs all task). Instead run the following command.** 
+### In-context learning (vLLM)
+```bash
+python in_context_learning/vllm_incontext.py --model "Qwen/Qwen3-30B-A3B-Instruct-2507" --functions fn_a --lengths 50 --train-size 200 --test-size 100
+```
+
+### Fine-tuning (local training)
+```bash
+python finetuning/main.py --results-path ./results_new/0/0 --model qwen1.7B --target_func fn_a --sequence_length 50 --train_set_size 200 --test_set_size 10000 --batch_size 20 --n_epochs 200
+```
+
+
+## Repo layout
+```
+.
+├── program_synthesis/        # LLM-ERM
+├── in_context_learning/      # vLLM few-shot ICL runner (batched inference)
+├── finetuning/               # Training/finetuning code + YAML sweeps
+├── src/                      # Shared data generators & target functions
+├── requirements.txt, environment.yaml
+└── README.md
+```
+
+> Details, CLI flags, artifacts, and extensions live in each submodule’s README:
+> - [`program_synthesis/README.md`](program_synthesis/README.md)  
+> - [`in_context_learning/README.md`](in_context_learning/README.md)  
+> - [`finetuning/README.md`](finetuning/README.md)
+
+## Citation
+
+If you find our work useful in your research or applications, please cite us using the following BibTeX:
 
 ```bash
-python runner.py   --functions fn_a   --lengths 100 50 30 25 20 --enable-code-interpreter
+empty{}
 ```
-
----
-
-## Replicate entire expriments
-
-1) **Set your API key**:
-
-```bash
-export OPENAI_API_KEY=sk-...
-```
-
-2) **Run this command to replicate. Note : This is long task, will cost $. It will run all funtions (fn_a fn_b fn_c fn_d fn_e fn_f fn_g fn_h fn_i fn_j fn_k fn_l ) for all the dimenstions (100 50 30 25 20). All other config used in paper are set as default.** 
-
-```bash
-python runner.py --enable-code-interpreter
-```
----
-
-## CLI usage
-
-```bash
-python runner.py   --functions fn_a fn_j fn_i   --lengths 100 50   --attempts 8   --model gpt-5   --max-output-tokens 20000   --concurrency 5   --timeout 1200   --enable-code-interpreter   --verbosity low   --reasoning-effort high   --train-size 100 --val-size 100 --test-size 10000   --seed 42   --dataset-dir datasets   --out-jsonl results_attempts.jsonl   --out-csv results_attempts.csv
-```
-
-### Environment variables (defaults)
-
-- `OPENAI_API_KEY` (required)
-- `OPENAI_MODEL=gpt-5`
-- `MAX_OUTPUT_TOKENS=20000`
-- `REASONING_EFFORT=high` (`minimal|medium|high`)
-- `TEXT_VERBOSITY=low` (`low|medium|high`)
-- `TOOL_CHOICE=auto` (`auto|none`)
-- `ENABLE_CODE_INTERPRETER=0` (`1` to enable)
-- `CONCURRENCY=5`
-- `PER_CALL_TIMEOUT_S=1200`
-- `ATTEMPTS=5`
-- `TRAIN_SIZE=100`, `VAL_SIZE=100`, `TEST_SIZE=10000`
-- `GLOBAL_SEED=42`
-- `DATASET_DIR=datasets`
-- `OUT_JSONL=results_attempts.jsonl`, `OUT_CSV=results_attempts.csv`
-- `LOG_LEVEL=INFO`
-- `DRY_RUN=0`
-
-> **Dry run** (`--dry-run` or `DRY_RUN=1`) prints the exact constructed prompt for each query and **does not** call the API.
-
----
-
-## Targets and functions
-
-`runner.py` uses a compact “experiment ID” → target mapping:
-
-| ID   | `FUNCTION_NAME_MAPPING` target | Domain |
-|------|-------------------------------|--------|
-| fn_a | `parity_all`                  | binary |
-| fn_b | `parity_first_half`           | binary |
-| fn_c | `patternmatch1`               | binary |
-| fn_d | `patternmatch2`               | binary |
-| fn_e | `parity_rand_3`               | binary |
-| fn_f | `parity_rand_10`              | binary |
-| fn_g | `palindrome`                  | binary |
-| fn_h | `dyck2`                       | binary (lengths: `[100,80,60,40,20]`) |
-| fn_i | `prime_decimal`               | **decimal** |
-| fn_j | `automata_parity`             | binary |
-| fn_k | `prime_decimal_tf_check`      | **decimal** |
-| fn_l | `sha256_parity`               | binary |
-
-Targets flagged as decimal are listed in `DECIMAL_FNS = {"prime_decimal", "prime_decimal_tf_check"}` and receive a decimal problem statement.
-
----
-
-## Data generators (high-level)
-
-All generators return a list of dicts:
-```python
-{'Input': np.array([... as strings ...]), 'Output': '0' or '1'}
-```
-
-- **`BinaryDataGenerator`**  
-  Balanced 50/50 label split **by construction** against any registered function in `TARGET_FUNCTIONS`.  
-  Efficient uniqueness + balancing loop; CPU set-ops for dedup; shuffles final dataset.
-
-- **`PalindromeDataGenerator`**  
-  Half palindromes, half non-palindromes (generated by flipping one bit in first half).
-
-- **`PatternBasedDataGenerator`**  
-  Balanced presence/absence of a configurable pattern (defaults to `10101010`).  
-  Generates with-pattern by insertion; generates without-pattern by “repairing” collisions.
-
-- **`Dyck2DataGenerator`**  
-  Balanced valid/invalid Dyck-2 sequences; invalids are near-miss corruptions of valids.  
-  Sequence length must be a multiple of 4 (2 bits/paren; pairs become `()[]`).
-
-- **Prime (decimal) families**  
-  - `PrimeDataGenerator` — balanced primes vs non-primes (random sampling + `sympy`).  
-  - `PrimeDecimalTailRestrictedDataGenerator` — primes vs **non-primes ending with {1,3,7,9}**.  
-
-See **`src/data_handler.py`** for constructor signatures and invariants (e.g., many require `num_samples` to be **even**).
-
----
-
-## Design notes & invariants
-
-- **Balancing**: most generators create exactly half positives/negatives to make accuracy comparable and stable.
-- **Lengths**: Dyck-2 requires `sequence_length % 4 == 0`; runner special-cases `fn_h`.
-- **Decimal vs binary**: affects prompt only; datasets are always rendered as strings: `'0'/'1'` for binary bits, `'0'..'9'` for decimal digits.
-
----

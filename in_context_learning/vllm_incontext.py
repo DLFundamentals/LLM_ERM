@@ -1,4 +1,4 @@
-# vllm_runner.py
+# vllm_incontext.py
 """
 This script orchestrates an end-to-end experiment loop for in-context learning
 using a local model served by vLLM.
@@ -23,7 +23,8 @@ import logging
 import os
 import re
 import sys
-import random
+import random, hashlib
+import numpy as np, torch
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
@@ -39,16 +40,14 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
-# Import the data generators from the provided project structure
-from data_handler import (
+# Import the data generators
+from src.data_handler import (
     BaseDataGenerator,
-    BinaryDataGenerator,
-    Dyck2DataGenerator,
-    PalindromeDataGenerator,
-    PatternBasedDataGenerator,
-    PrimeDataGenerator,
-    PrimeDecimalTailRestrictedDataGenerator,
+    get_data_generator,
+    create_stratified_splits,
 )
+
+from src.target_functions import EXPERIMENT_FUNCTION_MAPPING, EXPERIMENT_FUNCTION_METADATA
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -88,27 +87,14 @@ class Config:
     max_new_tokens: int = 1024
 
     # Artifacts
-    output_jsonl: str = "vllm_results_details.jsonl"
-    output_csv: str = "vllm_results_summary.csv"
+    output_jsonl: str = "in_context_learning/vllm_results_details.jsonl"
+    output_csv: str = "in_context_learning/vllm_results_summary.csv"
 
 
 # =========================
-# Constants (from runner.py for consistency)
+# Constants (from target functions for consistency)
 # =========================
-FUNCTION_NAME_MAPPING = {
-    "fn_a": "parity_all",
-    "fn_b": "parity_first_half",
-    "fn_c": "patternmatch1",
-    "fn_d": "patternmatch2",
-    "fn_e": "parity_rand_3",
-    "fn_f": "parity_rand_10",
-    "fn_g": "palindrome",
-    "fn_h": "dyck2",
-    "fn_i": "prime_decimal",
-    "fn_j": "automata_parity",
-    "fn_k": "prime_decimal_tf_check",
-    "fn_l": "sha256_parity",
-}
+FUNCTION_NAME_MAPPING = EXPERIMENT_FUNCTION_MAPPING
 
 DECIMAL_FNS = {"prime_decimal", "prime_decimal_tf_check"}
 
@@ -144,31 +130,24 @@ class PromptGenerator:
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
+    def _stable_derived_seed(self, fn: str, L: int) -> int:
+        """
+        Match program_synthesis/runner.py:
+          key = f"{fn}|L={L}|train={train+val}|test={test}|base_seed={seed}"
+          derived = sha256(key)[:8] -> int -> mask 31 bits
+        """
+        key = (
+            f"{fn}|L={L}"
+            f"|train={self.cfg.train_size + 0}"   # val=0 in ICL
+            f"|test={self.cfg.test_size}"
+            f"|base_seed={self.cfg.seed}"
+        )
+        digest = hashlib.sha256(key.encode("utf-8")).digest()
+        return (int.from_bytes(digest[:8], "big") & 0x7FFFFFFF)
+
     def _get_data_generator(self, target_name: str, L: int, size: int) -> BaseDataGenerator:
         """Selects and instantiates the correct data generator for a given task."""
-        # This logic is adapted from your scripts to use the available generators
-        if target_name == 'dyck2':
-            # Dyck-2 generator has constraints on sample size for smaller lengths
-            if L == 20:
-                return Dyck2DataGenerator(L, size, allow_duplicates=True)
-            else:
-                return Dyck2DataGenerator(L, size)
-        if target_name in ['patternmatch1', 'patternmatch2']:
-            if target_name == 'patternmatch2':
-                return PatternBasedDataGenerator(L, size, pattern_string='00111111')
-            else:
-                return PatternBasedDataGenerator(L, size)  # defaults to '10101010'
-        if target_name == "palindrome":
-            return PalindromeDataGenerator(L, size)
-        if target_name == "prime_decimal":
-            return PrimeDataGenerator(L, size)
-        if target_name == "prime_decimal_tf_check":
-            return PrimeDecimalTailRestrictedDataGenerator(L, size, allow_leading_zeros=False)
-        # Default to BinaryDataGenerator for all other function names
-        if target_name in FUNCTION_NAME_MAPPING.values():
-            return BinaryDataGenerator(target_name, L, size)
-
-        raise ValueError(f"No data generator found for target function '{target_name}'")
+        return get_data_generator(target_name, L, size)
 
     def _generate_lines(self, generator: BaseDataGenerator, target_name: str) -> List[str]:
         """Runs the data generator and formats the output into lines."""
@@ -187,17 +166,43 @@ class PromptGenerator:
         target_name = FUNCTION_NAME_MAPPING[fn]
         is_decimal = target_name in DECIMAL_FNS
 
-        # Use a derived seed for deterministic data generation, same as in runner.py
-        derived_seed = (hash((fn, L)) & 0x7FFFFFFF) ^ self.cfg.seed
-        random.seed(derived_seed)
+        # Use the SAME derived seed scheme as program_synthesis/runner.py
+        derived_seed = self._stable_derived_seed(fn, L)
 
-        logger.info(f"Generating data for task (fn={fn}, L={L}) with seed {derived_seed}...")
+        # Seed ALL relevant RNGs for reproducibility across generators that use torch / numpy
+        random.seed(derived_seed)
+        np.random.seed(derived_seed)
         try:
-            # Generate in-context examples (train) and test queries
-            train_gen = self._get_data_generator(target_name, L, self.cfg.train_size)
-            test_gen = self._get_data_generator(target_name, L, self.cfg.test_size)
-            train_lines = self._generate_lines(train_gen, target_name)
-            test_lines = self._generate_lines(test_gen, target_name)
+            torch.manual_seed(derived_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(derived_seed)
+        except Exception:
+            pass
+        
+        logger.info(f"Generating pooled data for task (fn={fn}, L={L}) with seed {derived_seed}...")
+        try:
+            # 1) Build ONE pooled dataset of size (train + val=0 + test)
+            total = self.cfg.train_size + self.cfg.test_size
+            pooled_gen = self._get_data_generator(target_name, L, total)
+            pooled = pooled_gen.generate_data()  # List[dict: {'Input': np.array, 'Output': '0'|'1'}]
+
+            # 2) Stratified split (val_size=0) using the shared helper
+            train_split, val_split, test_split = create_stratified_splits(
+                all_samples=pooled,
+                train_size=self.cfg.train_size,
+                val_size=0,
+                test_size=self.cfg.test_size,
+                device='cpu'
+            )
+
+            # 3) Convert to the same "<seq> -> <label>" line format
+            def _to_lines(samples):
+                return [f"{''.join(s['Input'])} -> {s['Output']}" for s in samples]
+            train_lines = _to_lines(train_split)
+            test_lines  = _to_lines(test_split)
+
+            # 4) Shuffle train lines (runner shuffles train & val before persisting)
+            random.shuffle(train_lines)
         except Exception as e:
             logger.error(f"Failed to generate data for (fn={fn}, L={L}): {e}", exc_info=True)
             return []
@@ -246,10 +251,8 @@ class VLLMRunner:
         """Executes the full experiment across all specified tasks."""
         all_results = []
         for fn in self.cfg.functions:
-            if fn == "fn_h":
-                current_lengths = [100, 80, 60, 40, 20]
-            else:
-                current_lengths = self.cfg.lengths
+            task_meta = EXPERIMENT_FUNCTION_METADATA.get(fn, {})
+            current_lengths = task_meta.get("lengths", self.cfg.lengths)
             for L in current_lengths:
                 task_prompts = self.prompt_generator.generate_prompts_for_task(fn, L)
                 if not task_prompts:
@@ -293,7 +296,7 @@ def parse_and_evaluate(results: List[Dict[str, Any]]) -> Tuple[List[Dict[str, An
         model_output = res['model_output']
 
         try:
-            # 1. Use regex to find a JSON object within the model's output string.
+            # 1. Find a JSON object within the model's output string.
             #    This handles cases where the model adds introductory/concluding text.
             #    re.DOTALL makes '.' match newlines, in case the JSON is multi-line.
             match = re.search(r'\{.*\}', model_output, re.DOTALL)
@@ -390,6 +393,7 @@ def parse_args() -> Config:
 
     # Sampling
     p.add_argument("--temperature", type=float, help=f"Sampling temperature (default: {cfg.temperature})")
+    p.add_argument("--top-p", type=float, help=f"top_p (default: {cfg.top_p})")
     p.add_argument("--max-new-tokens", type=int, help=f"Max generated tokens (default: {cfg.max_new_tokens})")
 
     # Output
@@ -408,6 +412,7 @@ def parse_args() -> Config:
     if args.tensor_parallel_size: cfg.tensor_parallel_size = args.tensor_parallel_size
     if args.max_model_len: cfg.max_model_len = args.max_model_len
     if args.temperature is not None: cfg.temperature = args.temperature
+    if args.top_p is not None: cfg.top_p = args.top_p
     if args.out_jsonl: cfg.output_jsonl = args.out_jsonl
     if args.out_csv: cfg.output_csv = args.out_csv
 
