@@ -68,5 +68,13 @@ python finetuning/main.py --results-path ./results_new/0/0 --model qwen1.7B --ta
 If you find our work useful in your research or applications, please cite us using the following BibTeX:
 
 ```bash
-empty{}
+@misc{singhal2025llmermsampleefficientprogramlearning,
+      title={LLM-ERM: Sample-Efficient Program Learning via LLM-Guided Search}, 
+      author={Shivam Singhal and Eran Malach and Tomaso Poggio and Tomer Galanti},
+      year={2025},
+      eprint={2510.14331},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2510.14331}, 
+}
 ```
