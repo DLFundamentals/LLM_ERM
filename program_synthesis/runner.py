@@ -42,7 +42,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
-from openai import AsyncOpenAI
+import aiohttp
 
 # --- data generators ---
 from src.data_handler import get_data_generator, create_stratified_splits
@@ -171,8 +171,9 @@ def setup_logger(level: str = "INFO") -> logging.Logger:
 @dataclass
 class Config:
     # OpenAI
-    api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
-    model: str = os.getenv("OPENAI_MODEL", "gpt-5")
+    tamu_api_key: str = field(default_factory=lambda: os.getenv("TAMUS_AI_CHAT_API_KEY", ""))
+    tamu_endpoint: str = os.getenv("TAMUS_AI_CHAT_API_ENDPOINT", "https://chat-api.tamu.ai")
+    model: str = os.getenv("OPENAI_MODEL", "protected.gpt-5")
     max_output_tokens: int = int(os.getenv("MAX_OUTPUT_TOKENS", "20000"))
     reasoning_effort: str = os.getenv("REASONING_EFFORT", "high")
     verbosity: Optional[str] = os.getenv("TEXT_VERBOSITY", "low")
@@ -539,13 +540,43 @@ def evaluate_accuracy(fn_callable: Callable[[str], int], data_lines: List[str], 
 # The Runner coordinates dataset retrieval, API calls, code extraction/compilation,
 # evaluation, early stopping, logging, and artifact writing.
 
+def extract_text_from_api_response(res: Dict[str, Any]) -> str:
+    """
+    Robustly extracts a text response from multiple possible API shapes.
+    """
+    # 1. Check for the simple "output_text" convenience key first.
+    out_text = res.get("output_text")
+    if isinstance(out_text, str) and out_text:
+        return out_text.strip()
+
+    # 2. Check for the standard OpenAI "choices" structure.
+    try:
+        return res["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError):
+        pass
+
+    # 3. Check for the deeply nested "output" structure seen in some gateway APIs.
+    try:
+        # It's usually output -> list -> content -> list -> text
+        output_list = res.get("output", [])
+        if output_list:
+            content_list = output_list[0].get("content", [])
+            if content_list:
+                return content_list[0].get("text", "").strip()
+    except (KeyError, IndexError, TypeError):
+        pass
+    
+    # 4. If nothing is found, return an empty string.
+    return ""
+
+
 class Runner:
-    def __init__(self, cfg: Config, logger: logging.Logger):
-        if not cfg.api_key:
-            raise SystemExit("OPENAI_API_KEY is required.")
+    def __init__(self, cfg: Config, logger: logging.Logger, session: aiohttp.ClientSession):
+        if not cfg.tamu_api_key:
+            raise SystemExit("TAMUS_AI_CHAT_API_KEY is required.")
         self.cfg = cfg
         self.log = logger
-        self.client = AsyncOpenAI(api_key=cfg.api_key)
+        self.session = session
         self.sem = asyncio.Semaphore(cfg.concurrency)
 
         # Optional tool injection (Code Interpreter) for the Responses API.
@@ -562,15 +593,15 @@ class Runner:
         body_preview_size = len(json.dumps({"input":[{"role":"user","content":[{"type":"input_text","text": prompt_text}]}]}))
         body: Dict[str, Any] = {
             "model": self.cfg.model,
-            "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt_text}]}],
-            "reasoning": {"effort": self.cfg.reasoning_effort},
-            "max_output_tokens": self.cfg.max_output_tokens,
-            "tool_choice": self.cfg.tool_choice,
+            # The "content" field should be a list containing a dictionary
+            # that specifies the type and text of the content.
+            "messages": [{"role": "user", "content": [{"type": "text", "text": prompt_text}]}],
+            "stream": False,
+            "reasoning_effort": self.cfg.reasoning_effort,
+            "max_completion_tokens": self.cfg.max_output_tokens,
         }
-        if self.tools:
-            body["tools"] = self.tools
         if self.cfg.verbosity:
-            body["text"] = {"verbosity": self.cfg.verbosity}
+            body["verbosity"] = self.cfg.verbosity
 
         if self.cfg.dry_run:
             # In dry‑run, just log the prompt and return a lightweight record.
@@ -582,41 +613,36 @@ class Runner:
             }
 
         async def _try_call(tag: str):
-            # Execute a single Responses API call with a timeout and collect rich telemetry
+            # MODIFIED: Execute a single TAMU API call using aiohttp
             t0 = time.perf_counter()
+            url = f"{self.cfg.tamu_endpoint.rstrip('/')}/api/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {self.cfg.tamu_api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+            
             async with self.sem:
-                res = await asyncio.wait_for(
-                    self.client.responses.create(**body),
-                    timeout=self.cfg.per_call_timeout_s,
-                )
-                # Count how many tool_use/tool_result chunks came back
-                tool_uses = 0
-                tool_results_chars = 0
-                for item in getattr(res, "output", []) or []:
-                    t = getattr(item, "type", None)
-                    if t == "tool_use":
-                        tool_uses += 1
-                    elif t == "tool_result":
-                        content = getattr(item, "content", None)
-                        if isinstance(content, list):
-                            for part in content:
-                                txt = getattr(part, "text", None) if hasattr(part, "text") else part.get("text") if isinstance(part, dict) else None
-                                if isinstance(txt, str):
-                                    tool_results_chars += len(txt)
-                        elif isinstance(content, str):
-                            tool_results_chars += len(content)
+                async with self.session.post(
+                    url, json=body, headers=headers, timeout=self.cfg.per_call_timeout_s
+                ) as response:
+                    response.raise_for_status() # Raises an exception for 4xx/5xx status
+                    res_json = await response.json()
+
+            # Count how many tool_use/tool_result chunks came back
+            tool_uses = 0
+            tool_results_chars = 0
 
             dt_ms = int((time.perf_counter() - t0) * 1000)
-            usage = normalize_usage(getattr(res, "usage", {}))
+            usage = normalize_usage(res_json.get("usage", {}))
             cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-            out_text = (getattr(res, "output_text", "") or "").strip()
+            out_text = extract_text_from_api_response(res_json)
             self.log.info(tag, extra={
                 "fn": fn, "length": L, "attempt": attempt_idx,
                 "duration_ms": dt_ms, "prompt_chars": len(prompt_text),
                 "request_body_bytes": len(json.dumps(body)),
                 "input_section_bytes": body_preview_size,
                 "tools_enabled": bool(self.tools), "tool_count": len(self.tools),
-                "tool_uses": tool_uses, "tool_results_chars": tool_results_chars,
                 "prompt_tokens": usage.get("prompt_tokens"),
                 "reasoning_tokens": usage.get("reasoning_tokens"),
                 "output_tokens": usage.get("completion_tokens") or usage.get("output_tokens"),
@@ -629,8 +655,6 @@ class Runner:
                 "cached_tokens": cached, "duration_ms": dt_ms,
                 "request_body_bytes": len(json.dumps(body)),
                 "prompt_chars": len(prompt_text),
-                "tool_uses": tool_uses,
-                "tool_results_chars": tool_results_chars,
             }
 
         try:
@@ -719,7 +743,7 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
     fieldnames = [
         "fn", "length", "attempt", "prompt", "text",
         "duration_ms", "cached_tokens", "prompt_tokens", "completion_tokens",
-        "reasoning_tokens", "tool_uses", "tool_results_chars",
+        "reasoning_tokens",
         "val_acc", "test_acc", "stopped_early", "compile_error",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -738,8 +762,6 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
                 "prompt_tokens": usage.get("prompt_tokens"),
                 "completion_tokens": usage.get("completion_tokens"),
                 "reasoning_tokens": usage.get("reasoning_tokens"),
-                "tool_uses": r.get("tool_uses"),
-                "tool_results_chars": r.get("tool_results_chars"),
                 "val_acc": r.get("val_acc"),
                 "test_acc": r.get("test_acc"),
                 "stopped_early": r.get("stopped_early"),
@@ -764,7 +786,9 @@ def parse_args() -> Config:
     p.add_argument("--timeout", type=float, help="Per-call timeout seconds (default: 1200)")
 
     # OpenAI
-    p.add_argument("--model", help="Model name (default: gpt-5)")
+    p.add_argument("--tamu-api-key", help="TAMU API Key (or use TAMUS_AI_CHAT_API_KEY env var)")
+    p.add_argument("--tamu-endpoint", help="TAMU API Endpoint (or use TAMUS_AI_CHAT_API_ENDPOINT env var)")
+    p.add_argument("--model", help="Model name (default: protected.gpt-5)")
     p.add_argument("--max-output-tokens", type=int, help="Max output tokens (default: 20000)")
     p.add_argument("--enable-code-interpreter", action="store_true", help="Enable Code Interpreter tool")
     p.add_argument("--tool-choice", choices=["auto","none"], help="Tool choice (default: auto)")
@@ -793,6 +817,8 @@ def parse_args() -> Config:
     if args.attempts: cfg.attempts = args.attempts
     if args.concurrency: cfg.concurrency = args.concurrency
     if args.model: cfg.model = args.model
+    if args.tamu_api_key: cfg.tamu_api_key = args.tamu_api_key
+    if args.tamu_endpoint: cfg.tamu_endpoint = args.tamu_endpoint
     if args.max_output_tokens: cfg.max_output_tokens = args.max_output_tokens
     if args.enable_code_interpreter: cfg.enable_code_interpreter = True
     if args.tool_choice: cfg.tool_choice = args.tool_choice
@@ -813,14 +839,13 @@ def parse_args() -> Config:
 
 
 async def _amain(cfg: Config) -> None:
-    # Entrypoint for asyncio: build logger, run the experiment, then write artifacts.
+    # MODIFIED: Entrypoint now uses an aiohttp.ClientSession
     log = setup_logger(os.getenv("LOG_LEVEL", "INFO"))
-    runner = Runner(cfg, log)
-    try:
+    
+    async with aiohttp.ClientSession() as session:
+        runner = Runner(cfg, log, session)
         rows = await runner.run()
-    finally:
-        # Close the AsyncOpenAI client to release network resources.
-        await runner.client.close()
+
     write_jsonl(cfg.out_jsonl, rows)
     write_csv(cfg.out_csv, rows)
     log.info("artifacts_written", extra={"jsonl": cfg.out_jsonl, "csv": cfg.out_csv})
